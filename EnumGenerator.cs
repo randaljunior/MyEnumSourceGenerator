@@ -19,7 +19,7 @@ namespace MyEnumSourceGenerator
     public sealed class EnumGenerator : IIncrementalGenerator
     {
         private const string GenerateDescriptionsAttributeFqn = "MyEnumSourceGenerator.GenerateDescriptionsAttribute";
-        private const string GenerateJsonConvertersAttributeFqn = "MyEnumSourceGenerator.GenerateJsonConvertersAttribute";
+        private const string GenerateEnumJsonConvertersAttributeFqn = "MyEnumSourceGenerator.GenerateEnumJsonConvertersAttribute";
         private const string DescriptionAttributeFqn          = "MyEnumSourceGenerator.DescriptionAttribute";
         private const string FlagsAttributeFqn                = "System.FlagsAttribute";
 
@@ -33,8 +33,19 @@ namespace MyEnumSourceGenerator
                 [AttributeUsage(AttributeTargets.Enum, Inherited = false, AllowMultiple = false)]
                 public sealed class GenerateDescriptionsAttribute : Attribute { }
 
-                [AttributeUsage(AttributeTargets.Enum, Inherited = false, AllowMultiple = false)]
-                public sealed class GenerateJsonConvertersAttribute : Attribute { }
+                /// <summary>
+                /// Coloque este atributo em uma classe parcial que herde de
+                /// System.Text.Json.Serialization.JsonConverter&lt;TEnum&gt; para gerar
+                /// automaticamente os métodos Read e Write baseados nas descrições do enum.
+                /// </summary>
+                [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+                public sealed class GenerateEnumJsonConvertersAttribute : Attribute
+                {
+                    public Type EnumType { get; }
+                    /// <summary>Separador usado no Read/Write quando o enum possui [Flags]. Padrão: '|'.</summary>
+                    public char Separator { get; set; } = '|';
+                    public GenerateEnumJsonConvertersAttribute(Type enumType) => EnumType = enumType;
+                }
 
                 [AttributeUsage(AttributeTargets.Field, Inherited = false, AllowMultiple = false)]
                 public sealed class DescriptionAttribute : Attribute
@@ -50,6 +61,7 @@ namespace MyEnumSourceGenerator
             context.RegisterPostInitializationOutput(static ctx =>
                 ctx.AddSource("EnumGeneratorAttributes.g.cs", AttributeSource));
 
+            // Provider para extensões de descrição (ToDescription / FromDescription)
             var enumProvider = context.SyntaxProvider.ForAttributeWithMetadataName(
                 GenerateDescriptionsAttributeFqn,
                 predicate: static (node, _) => node is EnumDeclarationSyntax,
@@ -57,7 +69,20 @@ namespace MyEnumSourceGenerator
                 .Where(static m => m is not null);
 
             context.RegisterSourceOutput(enumProvider, static (ctx, model) => Emit(ctx, model!.Value));
+
+            // Provider para converters JSON (Read / Write via partial class)
+            var converterProvider = context.SyntaxProvider.ForAttributeWithMetadataName(
+                GenerateEnumJsonConvertersAttributeFqn,
+                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                transform: static (ctx, _) => GetConverterModel(ctx))
+                .Where(static m => m is not null);
+
+            context.RegisterSourceOutput(converterProvider, static (ctx, model) => EmitPartialConverter(ctx, model!.Value));
         }
+
+        // ──────────────────────────────────────────────────────────────────────────────
+        // Enum extensions (ToDescription / FromDescription)
+        // ──────────────────────────────────────────────────────────────────────────────
 
         private static EnumModel? GetEnumModel(GeneratorAttributeSyntaxContext ctx)
         {
@@ -66,9 +91,6 @@ namespace MyEnumSourceGenerator
 
             bool isFlags = symbol.GetAttributes()
                 .Any(a => a.AttributeClass?.ToDisplayString() == FlagsAttributeFqn);
-
-            bool generateConverters = symbol.GetAttributes()
-                .Any(a => a.AttributeClass?.ToDisplayString() == GenerateJsonConvertersAttributeFqn);
 
             var membersBuilder = ImmutableArray.CreateBuilder<EnumMemberModel>();
             
@@ -86,28 +108,10 @@ namespace MyEnumSourceGenerator
 
             string? ns = symbol.ContainingNamespace.IsGlobalNamespace ? null : symbol.ContainingNamespace.ToDisplayString();
 
-            string readerMethod = "GetInt32";
-            if (symbol.EnumUnderlyingType != null)
-            {
-                readerMethod = symbol.EnumUnderlyingType.ToDisplayString() switch
-                {
-                    "long" or "System.Int64" => "GetInt64",
-                    "uint" or "System.UInt32" => "GetUInt32",
-                    "ulong" or "System.UInt64" => "GetUInt64",
-                    "short" or "System.Int16" => "GetInt16",
-                    "ushort" or "System.UInt16" => "GetUInt16",
-                    "byte" or "System.Byte" => "GetByte",
-                    "sbyte" or "System.SByte" => "GetSByte",
-                    _ => "GetInt32"
-                };
-            }
-
             return new EnumModel(
                 @namespace: ns,
                 enumName: symbol.Name,
                 isFlags: isFlags,
-                generateConverters: generateConverters,
-                readerMethod: readerMethod,
                 members: membersBuilder.ToImmutable(),
                 accessibility: symbol.DeclaredAccessibility
             );
@@ -121,7 +125,6 @@ namespace MyEnumSourceGenerator
             string i3 = i2 + "    ";
             string i4 = i3 + "    ";
 
-            string fullName = hasNs ? $"{model.Namespace}.{model.EnumName}" : model.EnumName;
             string access = model.Accessibility == Accessibility.Public ? "public" : "internal";
 
             var sb = new StringBuilder(512);
@@ -145,31 +148,25 @@ namespace MyEnumSourceGenerator
             sb.Append(ind).AppendLine("{");
 
             // Static extensions (FromDescription)
-            sb.Append(i2).Append("extension(").Append(fullName).AppendLine(")");
+            sb.Append(i2).Append("extension(").Append(model.EnumName).AppendLine(")");
             sb.Append(i2).AppendLine("{");
             if (model.IsFlags)
-                EmitFlagsFromDescription(sb, model.Members, fullName, i3, i4, i4 + "    ");
+                EmitFlagsFromDescription(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
             else
-                EmitSimpleFromDescription(sb, model.Members, fullName, i3, i4, i4 + "    ");
+                EmitSimpleFromDescription(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
             sb.Append(i2).AppendLine("}");
             sb.AppendLine();
 
             // Instance extensions (ToDescription)
-            sb.Append(i2).Append("extension(").Append(fullName).AppendLine(" value)");
+            sb.Append(i2).Append("extension(").Append(model.EnumName).AppendLine(" value)");
             sb.Append(i2).AppendLine("{");
             if (model.IsFlags)
-                EmitFlagsMethod(sb, model.Members, fullName, i3, i4, i4 + "    ");
+                EmitFlagsMethod(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
             else
-                EmitSimpleMethod(sb, model.Members, fullName, i3, i4, i4 + "    ");
+                EmitSimpleMethod(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
             sb.Append(i2).AppendLine("}");
 
             sb.Append(ind).AppendLine("}");
-
-            if (model.GenerateConverters)
-            {
-                sb.AppendLine();
-                EmitConverters(sb, model, fullName, ind, i2, access);
-            }
 
             if (hasNs)
                 sb.AppendLine("}");
@@ -248,109 +245,178 @@ namespace MyEnumSourceGenerator
 
         private static string Escape(string v) => v.Replace("\"", "\\\"");
 
-        private static void EmitConverters(StringBuilder sb, EnumModel model, string fullName, string ind, string i2, string access)
+        // ──────────────────────────────────────────────────────────────────────────────
+        // JSON Converter (partial class gerada a partir de [GenerateEnumJsonConverters(typeof(T))])
+        // ──────────────────────────────────────────────────────────────────────────────
+
+        private static ConverterModel? GetConverterModel(GeneratorAttributeSyntaxContext ctx)
         {
+            if (ctx.TargetSymbol is not INamedTypeSymbol classSymbol)
+                return null;
+
+            var attr = ctx.Attributes.FirstOrDefault(a =>
+                a.AttributeClass?.ToDisplayString() == GenerateEnumJsonConvertersAttributeFqn);
+
+            if (attr is null || attr.ConstructorArguments.Length == 0)
+                return null;
+
+            // O argumento do construtor é o typeof(TEnum)
+            if (attr.ConstructorArguments[0].Value is not INamedTypeSymbol enumSymbol)
+                return null;
+
+            if (enumSymbol.TypeKind != TypeKind.Enum)
+                return null;
+
+            bool isFlags = enumSymbol.GetAttributes()
+                .Any(a => a.AttributeClass?.ToDisplayString() == FlagsAttributeFqn);
+
+            var membersBuilder = ImmutableArray.CreateBuilder<EnumMemberModel>();
+            foreach (var field in enumSymbol.GetMembers().OfType<IFieldSymbol>()
+                .Where(f => f.IsStatic && f.HasConstantValue))
+            {
+                var descAttr = field.GetAttributes()
+                    .FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == DescriptionAttributeFqn);
+
+                string description = field.Name;
+                if (descAttr is { ConstructorArguments.Length: > 0 } &&
+                    descAttr.ConstructorArguments[0].Value is string desc)
+                    description = desc;
+
+                membersBuilder.Add(new EnumMemberModel(field.Name, description));
+            }
+
+            string readerMethod = "GetInt32";
+            if (enumSymbol.EnumUnderlyingType != null)
+            {
+                readerMethod = enumSymbol.EnumUnderlyingType.ToDisplayString() switch
+                {
+                    "long" or "System.Int64"   => "GetInt64",
+                    "uint" or "System.UInt32"  => "GetUInt32",
+                    "ulong" or "System.UInt64" => "GetUInt64",
+                    "short" or "System.Int16"  => "GetInt16",
+                    "ushort" or "System.UInt16"=> "GetUInt16",
+                    "byte" or "System.Byte"    => "GetByte",
+                    "sbyte" or "System.SByte"  => "GetSByte",
+                    _ => "GetInt32"
+                };
+            }
+
+            string? classNs = classSymbol.ContainingNamespace.IsGlobalNamespace
+                ? null
+                : classSymbol.ContainingNamespace.ToDisplayString();
+
+            string? enumNs = enumSymbol.ContainingNamespace.IsGlobalNamespace
+                ? null
+                : enumSymbol.ContainingNamespace.ToDisplayString();
+
+            // Lê o separador do named argument (ex: Separator = ',')
+            char separator = '|';
+            var sepArg = attr.NamedArguments.FirstOrDefault(kv => kv.Key == "Separator");
+            if (sepArg.Key == "Separator" && sepArg.Value.Value is char sepChar)
+                separator = sepChar;
+
+            return new ConverterModel(
+                classNamespace: classNs,
+                className: classSymbol.Name,
+                enumNamespace: enumNs,
+                enumName: enumSymbol.Name,
+                isFlags: isFlags,
+                readerMethod: readerMethod,
+                separator: separator,
+                members: membersBuilder.ToImmutable()
+            );
+        }
+
+        private static void EmitPartialConverter(SourceProductionContext ctx, ConverterModel model)
+        {
+            bool hasNs = model.ClassNamespace is not null;
+            string ind = hasNs ? "    " : "";
+            string i2  = ind + "    ";
+
+            // Nome totalmente qualificado do enum para evitar colisões de namespace
+            string fullEnum = model.EnumNamespace is not null
+                ? $"global::{model.EnumNamespace}.{model.EnumName}"
+                : model.EnumName;
+
+            var sb = new StringBuilder(512);
+            sb.AppendLine("// <auto-generated/>");
+            sb.AppendLine("#nullable enable");
+            sb.AppendLine("using System;");
+            sb.AppendLine("using System.Text.Json;");
+            sb.AppendLine("using System.Text.Json.Serialization;");
+            sb.AppendLine();
+
+            if (hasNs)
+            {
+                sb.Append("namespace ").AppendLine(model.ClassNamespace);
+                sb.AppendLine("{");
+            }
+
+            // Emite apenas "partial class" — o usuário já declarou sealed, public e o construtor
+            sb.Append(ind).Append("partial class ").AppendLine(model.ClassName);
+            sb.Append(ind).AppendLine("{");
+
             if (!model.IsFlags)
             {
-                sb.Append(ind).Append(access).Append(" sealed class ").Append(model.EnumName).Append("JsonConverter : JsonConverter<").Append(fullName).AppendLine(">");
-                sb.Append(ind).AppendLine("{");
-                
-                sb.Append(i2).Append("public override ").Append(fullName).AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
-                sb.Append(i2).AppendLine("{");
-                sb.Append(i2).AppendLine("    if (reader.TokenType == JsonTokenType.Number) return (" + fullName + ")reader." + model.ReaderMethod + "();");
-                sb.Append(i2).AppendLine("    var str = reader.GetString();");
-                sb.Append(i2).AppendLine("    if (string.IsNullOrEmpty(str)) return default;");
-                sb.Append(i2).Append("    return ").Append(fullName).AppendLine(".FromDescription(str.AsSpan());");
-                sb.Append(i2).AppendLine("}");
-
-                sb.Append(i2).Append("public override void Write(Utf8JsonWriter writer, ").Append(fullName).AppendLine(" value, JsonSerializerOptions options)");
-                sb.Append(i2).AppendLine("{");
-                sb.Append(i2).AppendLine("    writer.WriteStringValue(value.ToDescription());");
-                sb.Append(i2).AppendLine("}");
-
-                sb.Append(ind).AppendLine("}");
+                EmitSimpleReadWrite(sb, fullEnum, model.ReaderMethod, i2);
             }
             else
             {
-                EmitFlagsConverter(sb, model, fullName, ind, i2, access, "Space", ' ');
-                sb.AppendLine();
-                EmitFlagsConverter(sb, model, fullName, ind, i2, access, "Comma", ',');
-                sb.AppendLine();
-                EmitFlagsConverter(sb, model, fullName, ind, i2, access, "Pipe", '|');
-                sb.AppendLine();
-                EmitFlagsArrayConverter(sb, model, fullName, ind, i2, access);
+                EmitFlagsReadWrite(sb, fullEnum, model.ReaderMethod, model.Separator, i2);
             }
+
+            sb.Append(ind).AppendLine("}");
+
+            if (hasNs)
+                sb.AppendLine("}");
+
+            string hintName = hasNs
+                ? $"{model.ClassNamespace}.{model.ClassName}.g.cs"
+                : $"{model.ClassName}.g.cs";
+
+            ctx.AddSource(hintName, sb.ToString());
         }
 
-        private static void EmitFlagsConverter(StringBuilder sb, EnumModel model, string fullName, string ind, string i2, string access, string nameSuffix, char separator)
+        private static void EmitSimpleReadWrite(StringBuilder sb, string fullEnum, string readerMethod, string i2)
         {
-            sb.Append(ind).Append(access).Append(" sealed class ").Append(model.EnumName).Append(nameSuffix).Append("JsonConverter : JsonConverter<").Append(fullName).AppendLine(">");
-            sb.Append(ind).AppendLine("{");
-                
-            sb.Append(i2).Append("public override ").Append(fullName).AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
+            sb.Append(i2).Append("public override ").Append(fullEnum)
+                .AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
             sb.Append(i2).AppendLine("{");
-            sb.Append(i2).AppendLine("    if (reader.TokenType == JsonTokenType.Number) return (" + fullName + ")reader." + model.ReaderMethod + "();");
+            sb.Append(i2).AppendLine($"    if (reader.TokenType == JsonTokenType.Number) return ({fullEnum})reader.{readerMethod}();");
             sb.Append(i2).AppendLine("    var str = reader.GetString();");
             sb.Append(i2).AppendLine("    if (string.IsNullOrEmpty(str)) return default;");
-            sb.Append(i2).Append("    return ").Append(fullName).Append(".FromDescription(str.AsSpan(), '").Append(separator).AppendLine("');");
-            sb.Append(i2).AppendLine("}");
-
-            sb.Append(i2).Append("public override void Write(Utf8JsonWriter writer, ").Append(fullName).AppendLine(" value, JsonSerializerOptions options)");
-            sb.Append(i2).AppendLine("{");
-            sb.Append(i2).Append("    writer.WriteStringValue(value.ToDescription('").Append(separator).AppendLine("'));");
-            sb.Append(i2).AppendLine("}");
-
-            sb.Append(ind).AppendLine("}");
-        }
-
-        private static void EmitFlagsArrayConverter(StringBuilder sb, EnumModel model, string fullName, string ind, string i2, string access)
-        {
-            sb.Append(ind).Append(access).Append(" sealed class ").Append(model.EnumName).Append("ArrayJsonConverter : JsonConverter<").Append(fullName).AppendLine(">");
-            sb.Append(ind).AppendLine("{");
-            
-            sb.Append(i2).Append("public override ").Append(fullName).AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
-            sb.Append(i2).AppendLine("{");
-            sb.Append(i2).AppendLine("    if (reader.TokenType != JsonTokenType.StartArray)");
-            sb.Append(i2).AppendLine("        throw new JsonException(\"Esperado início de array.\");");
-            sb.Append(i2).AppendLine();
-            sb.Append(i2).Append("    var result = (").Append(fullName).AppendLine(")0;");
-            sb.Append(i2).AppendLine("    while (reader.Read())");
-            sb.Append(i2).AppendLine("    {");
-            sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.EndArray) break;");
-            sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.Null) continue;");
-            sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.Number)");
-            sb.Append(i2).AppendLine("        {");
-            sb.Append(i2).Append("            result |= (").Append(fullName).AppendLine(")reader." + model.ReaderMethod + "();");
-            sb.Append(i2).AppendLine("            continue;");
-            sb.Append(i2).AppendLine("        }");
-            sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.String)");
-            sb.Append(i2).AppendLine("        {");
-            sb.Append(i2).AppendLine("            var str = reader.GetString();");
-            sb.Append(i2).AppendLine("            if (!string.IsNullOrEmpty(str))");
-            sb.Append(i2).Append("                result |= ").Append(fullName).AppendLine(".FromDescription(str.AsSpan(), ',');");
-            sb.Append(i2).AppendLine("            continue;");
-            sb.Append(i2).AppendLine("        }");
-            sb.Append(i2).AppendLine("        throw new JsonException(\"Esperado valor string ou number dentro do array.\");");
-            sb.Append(i2).AppendLine("    }");
-            sb.Append(i2).AppendLine("    return result;");
+            sb.Append(i2).Append("    return ").Append(fullEnum).AppendLine(".FromDescription(str.AsSpan());");
             sb.Append(i2).AppendLine("}");
             sb.AppendLine();
-
-            sb.Append(i2).Append("public override void Write(Utf8JsonWriter writer, ").Append(fullName).AppendLine(" value, JsonSerializerOptions options)");
+            sb.Append(i2).Append("public override void Write(Utf8JsonWriter writer, ").Append(fullEnum)
+                .AppendLine(" value, JsonSerializerOptions options)");
             sb.Append(i2).AppendLine("{");
-            sb.Append(i2).AppendLine("    var span = value.ToDescription(',').AsSpan();");
-            sb.Append(i2).AppendLine("    writer.WriteStartArray();");
-            sb.Append(i2).AppendLine("    foreach (var item in span.Split(','))");
-            sb.Append(i2).AppendLine("    {");
-            sb.Append(i2).AppendLine("        var trimmed = span[item].Trim();");
-            sb.Append(i2).AppendLine("        if (!trimmed.IsEmpty) writer.WriteStringValue(trimmed);");
-            sb.Append(i2).AppendLine("    }");
-            sb.Append(i2).AppendLine("    writer.WriteEndArray();");
+            sb.Append(i2).AppendLine("    writer.WriteStringValue(value.ToDescription());");
             sb.Append(i2).AppendLine("}");
+        }
 
-            sb.Append(ind).AppendLine("}");
+        private static void EmitFlagsReadWrite(StringBuilder sb, string fullEnum, string readerMethod, char separator, string i2)
+        {
+            sb.Append(i2).Append("public override ").Append(fullEnum)
+                .AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i2).AppendLine($"    if (reader.TokenType == JsonTokenType.Number) return ({fullEnum})reader.{readerMethod}();");
+            sb.Append(i2).AppendLine("    var str = reader.GetString();");
+            sb.Append(i2).AppendLine("    if (string.IsNullOrEmpty(str)) return default;");
+            sb.Append(i2).Append("    return ").Append(fullEnum).Append($".FromDescription(str.AsSpan(), '{separator}');").AppendLine();
+            sb.Append(i2).AppendLine("}");
+            sb.AppendLine();
+            sb.Append(i2).Append("public override void Write(Utf8JsonWriter writer, ").Append(fullEnum)
+                .AppendLine(" value, JsonSerializerOptions options)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i2).AppendLine($"    writer.WriteStringValue(value.ToDescription('{separator}'));");
+            sb.Append(i2).AppendLine("}");
         }
     }
+
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Models
+    // ──────────────────────────────────────────────────────────────────────────────
 
     internal readonly struct EnumMemberModel(string name, string description) : IEquatable<EnumMemberModel>
     {
@@ -361,37 +427,79 @@ namespace MyEnumSourceGenerator
         public override int GetHashCode() => (Name.GetHashCode() * 397) ^ Description.GetHashCode();
     }
 
-    internal readonly struct EnumModel(string? @namespace, string enumName, bool isFlags, bool generateConverters, string readerMethod, ImmutableArray<EnumMemberModel> members, Accessibility accessibility) : IEquatable<EnumModel>
+    internal readonly struct EnumModel(string? @namespace, string enumName, bool isFlags, ImmutableArray<EnumMemberModel> members, Accessibility accessibility) : IEquatable<EnumModel>
     {
         public string? Namespace { get; } = @namespace;
         public string EnumName { get; } = enumName;
         public bool IsFlags { get; } = isFlags;
-        public bool GenerateConverters { get; } = generateConverters;
-        public string ReaderMethod { get; } = readerMethod;
         public Accessibility Accessibility { get; } = accessibility;
         public ImmutableArray<EnumMemberModel> Members { get; } = members;
 
-        public bool Equals(EnumModel other) => 
-            Namespace == other.Namespace && 
-            EnumName == other.EnumName && 
-            IsFlags == other.IsFlags && 
-            GenerateConverters == other.GenerateConverters &&
-            ReaderMethod == other.ReaderMethod &&
-            Accessibility == other.Accessibility && 
+        public bool Equals(EnumModel other) =>
+            Namespace == other.Namespace &&
+            EnumName == other.EnumName &&
+            IsFlags == other.IsFlags &&
+            Accessibility == other.Accessibility &&
             Members.SequenceEqual(other.Members);
 
         public override bool Equals(object? obj) => obj is EnumModel o && Equals(o);
-        public override int GetHashCode() 
-        { 
-            unchecked 
-            { 
-                int h = 17; 
-                h = h * 31 + (Namespace?.GetHashCode() ?? 0); 
-                h = h * 31 + EnumName.GetHashCode(); 
-                h = h * 31 + GenerateConverters.GetHashCode();
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int h = 17;
+                h = h * 31 + (Namespace?.GetHashCode() ?? 0);
+                h = h * 31 + EnumName.GetHashCode();
+                h = h * 31 + IsFlags.GetHashCode();
+                return h;
+            }
+        }
+    }
+
+    internal readonly struct ConverterModel(
+        string? classNamespace,
+        string className,
+        string? enumNamespace,
+        string enumName,
+        bool isFlags,
+        string readerMethod,
+        char separator,
+        ImmutableArray<EnumMemberModel> members) : IEquatable<ConverterModel>
+    {
+        public string? ClassNamespace { get; } = classNamespace;
+        public string ClassName { get; } = className;
+        public string? EnumNamespace { get; } = enumNamespace;
+        public string EnumName { get; } = enumName;
+        public bool IsFlags { get; } = isFlags;
+        public string ReaderMethod { get; } = readerMethod;
+        public char Separator { get; } = separator;
+        public ImmutableArray<EnumMemberModel> Members { get; } = members;
+
+        public bool Equals(ConverterModel other) =>
+            ClassNamespace == other.ClassNamespace &&
+            ClassName == other.ClassName &&
+            EnumNamespace == other.EnumNamespace &&
+            EnumName == other.EnumName &&
+            IsFlags == other.IsFlags &&
+            ReaderMethod == other.ReaderMethod &&
+            Separator == other.Separator &&
+            Members.SequenceEqual(other.Members);
+
+        public override bool Equals(object? obj) => obj is ConverterModel o && Equals(o);
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int h = 17;
+                h = h * 31 + (ClassNamespace?.GetHashCode() ?? 0);
+                h = h * 31 + ClassName.GetHashCode();
+                h = h * 31 + (EnumNamespace?.GetHashCode() ?? 0);
+                h = h * 31 + EnumName.GetHashCode();
+                h = h * 31 + IsFlags.GetHashCode();
                 h = h * 31 + ReaderMethod.GetHashCode();
-                return h; 
-            } 
+                h = h * 31 + Separator.GetHashCode();
+                return h;
+            }
         }
     }
 }
