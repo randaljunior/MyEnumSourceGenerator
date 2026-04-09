@@ -113,22 +113,28 @@ namespace MyEnumSourceGenerator
                 sb.AppendLine("{");
             }
 
-            // C# 14 compatible implicit extension syntax
-            sb.Append(ind).Append(access).Append(" implicit extension ").Append(model.EnumName).Append("Extensions for ").AppendLine(model.EnumName);
+            // C# 14 extension members syntax
+            sb.Append(ind).Append(access).Append(" static class ").Append(model.EnumName).AppendLine("Extensions");
             sb.Append(ind).AppendLine("{");
 
+            // Static extensions (FromDescription)
+            sb.Append(i2).Append("extension(").Append(fullName).AppendLine(")");
+            sb.Append(i2).AppendLine("{");
             if (model.IsFlags)
-            {
-                EmitFlagsMethod(sb, model.Members, fullName, i2, i3, i4);
-                sb.AppendLine();
-                EmitFlagsFromDescription(sb, model.Members, fullName, i2, i3, i4);
-            }
+                EmitFlagsFromDescription(sb, model.Members, fullName, i3, i4, i4 + "    ");
             else
-            {
-                EmitSimpleMethod(sb, model.Members, fullName, i2, i3, i4);
-                sb.AppendLine();
-                EmitSimpleFromDescription(sb, model.Members, fullName, i2, i3, i4);
-            }
+                EmitSimpleFromDescription(sb, model.Members, fullName, i3, i4, i4 + "    ");
+            sb.Append(i2).AppendLine("}");
+            sb.AppendLine();
+
+            // Instance extensions (ToDescription)
+            sb.Append(i2).Append("extension(").Append(fullName).AppendLine(" value)");
+            sb.Append(i2).AppendLine("{");
+            if (model.IsFlags)
+                EmitFlagsMethod(sb, model.Members, fullName, i3, i4, i4 + "    ");
+            else
+                EmitSimpleMethod(sb, model.Members, fullName, i3, i4, i4 + "    ");
+            sb.Append(i2).AppendLine("}");
 
             sb.Append(ind).AppendLine("}");
 
@@ -141,13 +147,13 @@ namespace MyEnumSourceGenerator
 
         private static void EmitSimpleMethod(StringBuilder sb, ImmutableArray<EnumMemberModel> members, string fullName, string i2, string i3, string i4)
         {
-            sb.Append(i2).AppendLine("public string ToDescription() => this switch");
+            sb.Append(i2).AppendLine("public string ToDescription() => value switch");
             sb.Append(i2).AppendLine("{");
 
             foreach (var member in members)
                 sb.Append(i3).Append(fullName).Append(".").Append(member.Name).Append(" => \"").Append(Escape(member.Description)).AppendLine("\",");
 
-            sb.Append(i3).AppendLine("_ => this.ToString()");
+            sb.Append(i3).AppendLine("_ => value.ToString()");
             sb.Append(i2).AppendLine("};");
         }
 
@@ -171,12 +177,12 @@ namespace MyEnumSourceGenerator
 
             foreach (var member in members)
             {
-                sb.Append(i3).Append("if ((this & ").Append(fullName).Append('.').Append(member.Name)
+                sb.Append(i3).Append("if ((value & ").Append(fullName).Append('.').Append(member.Name)
                   .Append(") == ").Append(fullName).Append('.').Append(member.Name).AppendLine(")");
                 sb.Append(i4).Append("parts.Add(\"").Append(Escape(member.Description)).AppendLine("\");");
             }
 
-            sb.Append(i3).AppendLine("return parts.Count > 0 ? string.Join(separator.ToString(), parts) : this.ToString();");
+            sb.Append(i3).AppendLine("return parts.Count > 0 ? string.Join(separator.ToString(), parts) : value.ToString();");
             sb.Append(i2).AppendLine("}");
         }
 
