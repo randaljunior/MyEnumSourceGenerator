@@ -86,11 +86,28 @@ namespace MyEnumSourceGenerator
 
             string? ns = symbol.ContainingNamespace.IsGlobalNamespace ? null : symbol.ContainingNamespace.ToDisplayString();
 
+            string readerMethod = "GetInt32";
+            if (symbol.EnumUnderlyingType != null)
+            {
+                readerMethod = symbol.EnumUnderlyingType.ToDisplayString() switch
+                {
+                    "long" or "System.Int64" => "GetInt64",
+                    "uint" or "System.UInt32" => "GetUInt32",
+                    "ulong" or "System.UInt64" => "GetUInt64",
+                    "short" or "System.Int16" => "GetInt16",
+                    "ushort" or "System.UInt16" => "GetUInt16",
+                    "byte" or "System.Byte" => "GetByte",
+                    "sbyte" or "System.SByte" => "GetSByte",
+                    _ => "GetInt32"
+                };
+            }
+
             return new EnumModel(
                 @namespace: ns,
                 enumName: symbol.Name,
                 isFlags: isFlags,
                 generateConverters: generateConverters,
+                readerMethod: readerMethod,
                 members: membersBuilder.ToImmutable(),
                 accessibility: symbol.DeclaredAccessibility
             );
@@ -240,6 +257,7 @@ namespace MyEnumSourceGenerator
                 
                 sb.Append(i2).Append("public override ").Append(fullName).AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
                 sb.Append(i2).AppendLine("{");
+                sb.Append(i2).AppendLine("    if (reader.TokenType == JsonTokenType.Number) return (" + fullName + ")reader." + model.ReaderMethod + "();");
                 sb.Append(i2).AppendLine("    var str = reader.GetString();");
                 sb.Append(i2).AppendLine("    if (string.IsNullOrEmpty(str)) return default;");
                 sb.Append(i2).Append("    return ").Append(fullName).AppendLine(".FromDescription(str.AsSpan());");
@@ -271,6 +289,7 @@ namespace MyEnumSourceGenerator
                 
             sb.Append(i2).Append("public override ").Append(fullName).AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
             sb.Append(i2).AppendLine("{");
+            sb.Append(i2).AppendLine("    if (reader.TokenType == JsonTokenType.Number) return (" + fullName + ")reader." + model.ReaderMethod + "();");
             sb.Append(i2).AppendLine("    var str = reader.GetString();");
             sb.Append(i2).AppendLine("    if (string.IsNullOrEmpty(str)) return default;");
             sb.Append(i2).Append("    return ").Append(fullName).Append(".FromDescription(str.AsSpan(), '").Append(separator).AppendLine("');");
@@ -299,14 +318,19 @@ namespace MyEnumSourceGenerator
             sb.Append(i2).AppendLine("    {");
             sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.EndArray) break;");
             sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.Null) continue;");
-            sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.String || reader.TokenType == JsonTokenType.Number)");
+            sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.Number)");
+            sb.Append(i2).AppendLine("        {");
+            sb.Append(i2).Append("            result |= (").Append(fullName).AppendLine(")reader." + model.ReaderMethod + "();");
+            sb.Append(i2).AppendLine("            continue;");
+            sb.Append(i2).AppendLine("        }");
+            sb.Append(i2).AppendLine("        if (reader.TokenType == JsonTokenType.String)");
             sb.Append(i2).AppendLine("        {");
             sb.Append(i2).AppendLine("            var str = reader.GetString();");
             sb.Append(i2).AppendLine("            if (!string.IsNullOrEmpty(str))");
             sb.Append(i2).Append("                result |= ").Append(fullName).AppendLine(".FromDescription(str.AsSpan(), ',');");
             sb.Append(i2).AppendLine("            continue;");
             sb.Append(i2).AppendLine("        }");
-            sb.Append(i2).AppendLine("        throw new JsonException(\"Esperado valor string dentro do array.\");");
+            sb.Append(i2).AppendLine("        throw new JsonException(\"Esperado valor string ou number dentro do array.\");");
             sb.Append(i2).AppendLine("    }");
             sb.Append(i2).AppendLine("    return result;");
             sb.Append(i2).AppendLine("}");
@@ -337,12 +361,13 @@ namespace MyEnumSourceGenerator
         public override int GetHashCode() => (Name.GetHashCode() * 397) ^ Description.GetHashCode();
     }
 
-    internal readonly struct EnumModel(string? @namespace, string enumName, bool isFlags, bool generateConverters, ImmutableArray<EnumMemberModel> members, Accessibility accessibility) : IEquatable<EnumModel>
+    internal readonly struct EnumModel(string? @namespace, string enumName, bool isFlags, bool generateConverters, string readerMethod, ImmutableArray<EnumMemberModel> members, Accessibility accessibility) : IEquatable<EnumModel>
     {
         public string? Namespace { get; } = @namespace;
         public string EnumName { get; } = enumName;
         public bool IsFlags { get; } = isFlags;
         public bool GenerateConverters { get; } = generateConverters;
+        public string ReaderMethod { get; } = readerMethod;
         public Accessibility Accessibility { get; } = accessibility;
         public ImmutableArray<EnumMemberModel> Members { get; } = members;
 
@@ -351,6 +376,7 @@ namespace MyEnumSourceGenerator
             EnumName == other.EnumName && 
             IsFlags == other.IsFlags && 
             GenerateConverters == other.GenerateConverters &&
+            ReaderMethod == other.ReaderMethod &&
             Accessibility == other.Accessibility && 
             Members.SequenceEqual(other.Members);
 
@@ -363,6 +389,7 @@ namespace MyEnumSourceGenerator
                 h = h * 31 + (Namespace?.GetHashCode() ?? 0); 
                 h = h * 31 + EnumName.GetHashCode(); 
                 h = h * 31 + GenerateConverters.GetHashCode();
+                h = h * 31 + ReaderMethod.GetHashCode();
                 return h; 
             } 
         }
