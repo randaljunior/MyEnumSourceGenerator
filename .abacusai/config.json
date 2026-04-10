@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Bash(dotnet *))",
+      "Bash(Bash(echo *))",
+      "Bash(Bash(dotnet *))",
+      "Bash(Bash(echo *))",
+      "Bash(Bash(dotnet *))",
+      "Bash(Bash(echo *))",
+      "Bash(Bash(dotnet *))",
+      "Bash(Bash(echo *))"
+    ]
+  }
+}

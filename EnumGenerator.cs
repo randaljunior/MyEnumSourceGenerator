@@ -20,6 +20,8 @@ namespace MyEnumSourceGenerator
     {
         private const string GenerateDescriptionsAttributeFqn = "MyEnumSourceGenerator.GenerateDescriptionsAttribute";
         private const string GenerateEnumJsonConvertersAttributeFqn = "MyEnumSourceGenerator.GenerateEnumJsonConvertersAttribute";
+        private const string GenerateEnumArrayJsonConvertersAttributeFqn = "MyEnumSourceGenerator.GenerateEnumArrayJsonConvertersAttribute";
+        private const string GenerateEnumNumericJsonConvertersAttributeFqn = "MyEnumSourceGenerator.GenerateEnumNumericJsonConvertersAttribute";
         private const string DescriptionAttributeFqn          = "MyEnumSourceGenerator.DescriptionAttribute";
         private const string FlagsAttributeFqn                = "System.FlagsAttribute";
 
@@ -30,8 +32,17 @@ namespace MyEnumSourceGenerator
 
             namespace MyEnumSourceGenerator
             {
+                /// <summary>
+                /// Decorates an enum to generate ToDescription / FromDescription extension methods.
+                /// Use the optional <paramref name="separator"/> to set the default separator for [Flags] enums (default: '|').
+                /// </summary>
                 [AttributeUsage(AttributeTargets.Enum, Inherited = false, AllowMultiple = false)]
-                public sealed class GenerateDescriptionsAttribute : Attribute { }
+                public sealed class GenerateDescriptionsAttribute : Attribute
+                {
+                    /// <summary>Separador padrão para enums [Flags]. Padrão: '|'.</summary>
+                    public char Separator { get; set; }
+                    public GenerateDescriptionsAttribute(char separator = '|') => Separator = separator;
+                }
 
                 /// <summary>
                 /// Coloque este atributo em uma classe parcial que herde de
@@ -43,8 +54,26 @@ namespace MyEnumSourceGenerator
                 {
                     public Type EnumType { get; }
                     /// <summary>Separador usado no Read/Write quando o enum possui [Flags]. Padrão: '|'.</summary>
-                    public char Separator { get; set; } = '|';
-                    public GenerateEnumJsonConvertersAttribute(Type enumType) => EnumType = enumType;
+                    public char Separator { get; set; }
+                    public GenerateEnumJsonConvertersAttribute(Type enumType, char separator = '|')
+                    {
+                        EnumType = enumType;
+                        Separator = separator;
+                    }
+                }
+
+                [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+                public sealed class GenerateEnumArrayJsonConvertersAttribute : Attribute
+                {
+                    public Type EnumType { get; }
+                    public GenerateEnumArrayJsonConvertersAttribute(Type enumType) => EnumType = enumType;
+                }
+
+                [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+                public sealed class GenerateEnumNumericJsonConvertersAttribute : Attribute
+                {
+                    public Type EnumType { get; }
+                    public GenerateEnumNumericJsonConvertersAttribute(Type enumType) => EnumType = enumType;
                 }
 
                 [AttributeUsage(AttributeTargets.Field, Inherited = false, AllowMultiple = false)]
@@ -74,10 +103,27 @@ namespace MyEnumSourceGenerator
             var converterProvider = context.SyntaxProvider.ForAttributeWithMetadataName(
                 GenerateEnumJsonConvertersAttributeFqn,
                 predicate: static (node, _) => node is ClassDeclarationSyntax,
-                transform: static (ctx, _) => GetConverterModel(ctx))
+                transform: static (ctx, _) => GetConverterModel(ctx, false))
                 .Where(static m => m is not null);
 
             context.RegisterSourceOutput(converterProvider, static (ctx, model) => EmitPartialConverter(ctx, model!.Value));
+
+            // Provider para converters JSON em array
+            var arrayConverterProvider = context.SyntaxProvider.ForAttributeWithMetadataName(
+                GenerateEnumArrayJsonConvertersAttributeFqn,
+                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                transform: static (ctx, _) => GetConverterModel(ctx, true))
+                .Where(static m => m is not null);
+
+            context.RegisterSourceOutput(arrayConverterProvider, static (ctx, model) => EmitPartialConverter(ctx, model!.Value));
+
+            var numericConverterProvider = context.SyntaxProvider.ForAttributeWithMetadataName(
+                GenerateEnumNumericJsonConvertersAttributeFqn,
+                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                transform: static (ctx, _) => GetConverterModel(ctx, false, true))
+                .Where(static m => m is not null);
+
+            context.RegisterSourceOutput(numericConverterProvider, static (ctx, model) => EmitPartialConverter(ctx, model!.Value));
         }
 
         // ──────────────────────────────────────────────────────────────────────────────
@@ -91,6 +137,24 @@ namespace MyEnumSourceGenerator
 
             bool isFlags = symbol.GetAttributes()
                 .Any(a => a.AttributeClass?.ToDisplayString() == FlagsAttributeFqn);
+
+            // Lê o separador de [GenerateDescriptions('|')] ou [GenerateDescriptions(Separator = 'x')]
+            char separator = '|';
+            var genAttr = ctx.Attributes.FirstOrDefault(a =>
+                a.AttributeClass?.ToDisplayString() == GenerateDescriptionsAttributeFqn);
+            if (genAttr is not null)
+            {
+                if (genAttr.ConstructorArguments.Length > 0 && genAttr.ConstructorArguments[0].Value is char consSep)
+                {
+                    separator = consSep;
+                }
+                else
+                {
+                    var sepArg = genAttr.NamedArguments.FirstOrDefault(kv => kv.Key == "Separator");
+                    if (sepArg.Key == "Separator" && sepArg.Value.Value is char sepChar)
+                        separator = sepChar;
+                }
+            }
 
             var membersBuilder = ImmutableArray.CreateBuilder<EnumMemberModel>();
             
@@ -112,6 +176,7 @@ namespace MyEnumSourceGenerator
                 @namespace: ns,
                 enumName: symbol.Name,
                 isFlags: isFlags,
+                separator: separator,
                 members: membersBuilder.ToImmutable(),
                 accessibility: symbol.DeclaredAccessibility
             );
@@ -143,28 +208,32 @@ namespace MyEnumSourceGenerator
                 sb.AppendLine("{");
             }
 
-            // C# 14 extension members syntax
+            // Extension methods class
             sb.Append(ind).Append(access).Append(" static class ").Append(model.EnumName).AppendLine("Extensions");
             sb.Append(ind).AppendLine("{");
 
-            // Static extensions (FromDescription)
             sb.Append(i2).Append("extension(").Append(model.EnumName).AppendLine(")");
             sb.Append(i2).AppendLine("{");
             if (model.IsFlags)
-                EmitFlagsFromDescription(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
+            {
+                EmitFlagsFromDescription(sb, model.Members, model.EnumName, model.Separator, i3, i4, i4 + "    ");
+            }
             else
+            {
                 EmitSimpleFromDescription(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
+            }
             sb.Append(i2).AppendLine("}");
+
             sb.AppendLine();
 
-            // Instance extensions (ToDescription)
-            sb.Append(i2).Append("extension(").Append(model.EnumName).AppendLine(" value)");
-            sb.Append(i2).AppendLine("{");
             if (model.IsFlags)
-                EmitFlagsMethod(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
+            {
+                EmitFlagsMethod(sb, model.Members, model.EnumName, model.Separator, i2, i3, i4);
+            }
             else
-                EmitSimpleMethod(sb, model.Members, model.EnumName, i3, i4, i4 + "    ");
-            sb.Append(i2).AppendLine("}");
+            {
+                EmitSimpleMethod(sb, model.Members, model.EnumName, i2, i3, i4);
+            }
 
             sb.Append(ind).AppendLine("}");
 
@@ -177,7 +246,7 @@ namespace MyEnumSourceGenerator
 
         private static void EmitSimpleMethod(StringBuilder sb, ImmutableArray<EnumMemberModel> members, string fullName, string i2, string i3, string i4)
         {
-            sb.Append(i2).AppendLine("public string ToDescription() => value switch");
+            sb.Append(i2).Append("public static string ToDescription(this ").Append(fullName).AppendLine(" value) => value switch");
             sb.Append(i2).AppendLine("{");
 
             foreach (var member in members)
@@ -185,6 +254,7 @@ namespace MyEnumSourceGenerator
 
             sb.Append(i3).AppendLine("_ => value.ToString()");
             sb.Append(i2).AppendLine("};");
+            sb.Append(i2).Append("public static string[] ToDescriptionArray(this ").Append(fullName).AppendLine(" value) => new[] { value.ToDescription() };");
         }
 
         private static void EmitSimpleFromDescription(StringBuilder sb, ImmutableArray<EnumMemberModel> members, string fullName, string i2, string i3, string i4)
@@ -201,9 +271,9 @@ namespace MyEnumSourceGenerator
             sb.Append(i2).AppendLine("};");
         }
 
-        private static void EmitFlagsMethod(StringBuilder sb, ImmutableArray<EnumMemberModel> members, string fullName, string i2, string i3, string i4)
+        private static void EmitFlagsMethod(StringBuilder sb, ImmutableArray<EnumMemberModel> members, string fullName, char defaultSeparator, string i2, string i3, string i4)
         {
-            sb.Append(i2).AppendLine("public string ToDescription(char separator = '|')");
+            sb.Append(i2).Append($"public static string ToDescription(this {fullName} value, char separator = '{defaultSeparator}')").AppendLine();
             sb.Append(i2).AppendLine("{");
             sb.Append(i3).AppendLine($"string[] parts = new string[{members.Length}];");
             sb.Append(i3).AppendLine("int count = 0;");
@@ -217,13 +287,30 @@ namespace MyEnumSourceGenerator
 
             sb.Append(i3).AppendLine("return count > 0 ? string.Join(separator.ToString(), parts, 0, count) : value.ToString();");
             sb.Append(i2).AppendLine("}");
+
+            sb.AppendLine();
+            sb.Append(i2).Append($"public static string[] ToDescriptionArray(this {fullName} value)").AppendLine();
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i3).AppendLine($"string[] parts = new string[{members.Length}];");
+            sb.Append(i3).AppendLine("int count = 0;");
+            foreach (var member in members)
+            {
+                sb.Append(i3).Append("if ((value & ").Append(fullName).Append('.').Append(member.Name)
+                  .Append(") == ").Append(fullName).Append('.').Append(member.Name).AppendLine(")");
+                sb.Append(i4).Append("parts[count++] = \"").Append(Escape(member.Description)).AppendLine("\";");
+            }
+            sb.Append(i3).AppendLine("if (count == 0) return new[] { value.ToString() };");
+            sb.Append(i3).AppendLine("var result = new string[count];");
+            sb.Append(i3).AppendLine("global::System.Array.Copy(parts, result, count);");
+            sb.Append(i3).AppendLine("return result;");
+            sb.Append(i2).AppendLine("}");
         }
 
-        private static void EmitFlagsFromDescription(StringBuilder sb, ImmutableArray<EnumMemberModel> members, string fullName, string i2, string i3, string i4)
+        private static void EmitFlagsFromDescription(StringBuilder sb, ImmutableArray<EnumMemberModel> members, string fullName, char defaultSeparator, string i2, string i3, string i4)
         {
-            sb.Append(i2).Append("public static ").Append(fullName).AppendLine(" FromDescription(string text, char separator = '|') => FromDescription(text.AsSpan(), separator);");
+            sb.Append(i2).Append("public static ").Append(fullName).Append($" FromDescription(string text, char separator = '{defaultSeparator}') => FromDescription(text.AsSpan(), separator);").AppendLine();
             sb.AppendLine();
-            sb.Append(i2).Append("public static ").Append(fullName).AppendLine(" FromDescription(global::System.ReadOnlySpan<char> text, char separator = '|')");
+            sb.Append(i2).Append("public static ").Append(fullName).Append($" FromDescription(global::System.ReadOnlySpan<char> text, char separator = '{defaultSeparator}')").AppendLine();
             sb.Append(i2).AppendLine("{");
             sb.Append(i3).Append("var result = (").Append(fullName).AppendLine(")0;");
             sb.Append(i3).AppendLine("foreach (var part in text.Split(separator))");
@@ -241,6 +328,48 @@ namespace MyEnumSourceGenerator
             sb.Append(i3).AppendLine("}");
             sb.Append(i3).AppendLine("return result;");
             sb.Append(i2).AppendLine("}");
+
+            sb.AppendLine();
+            sb.Append(i2).Append("public static ").Append(fullName).AppendLine(" FromDescription(global::System.Collections.Generic.IEnumerable<string> descriptions)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i3).Append("var result = (").Append(fullName).AppendLine(")0;");
+            sb.Append(i3).AppendLine("foreach (var desc in descriptions)");
+            sb.Append(i3).AppendLine("{");
+            sb.Append(i4).AppendLine("if (desc is null) continue;");
+            sb.Append(i4).AppendLine("var trimmed = desc.AsSpan().Trim();");
+            sb.Append(i4).AppendLine("if (trimmed.IsEmpty) continue;");
+            sb.Append(i4).AppendLine("switch (trimmed)");
+            sb.Append(i4).AppendLine("{");
+
+            foreach (var member in members)
+                sb.Append(i4).Append("    case \"").Append(Escape(member.Description)).Append("\": result |= ").Append(fullName).Append(".").Append(member.Name).AppendLine("; break;");
+
+            sb.Append(i4).AppendLine("    default: throw new global::System.ArgumentException($\"No member of " + fullName + " matches '{desc}'.\");");
+            sb.Append(i4).AppendLine("}");
+            sb.Append(i3).AppendLine("}");
+            sb.Append(i3).AppendLine("return result;");
+            sb.Append(i2).AppendLine("}");
+
+            sb.AppendLine();
+            sb.Append(i2).Append("public static ").Append(fullName).AppendLine(" FromDescription(string[] descriptions)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i3).Append("var result = (").Append(fullName).AppendLine(")0;");
+            sb.Append(i3).AppendLine("foreach (var desc in descriptions)");
+            sb.Append(i3).AppendLine("{");
+            sb.Append(i4).AppendLine("if (desc is null) continue;");
+            sb.Append(i4).AppendLine("var trimmed = desc.AsSpan().Trim();");
+            sb.Append(i4).AppendLine("if (trimmed.IsEmpty) continue;");
+            sb.Append(i4).AppendLine("switch (trimmed)");
+            sb.Append(i4).AppendLine("{");
+
+            foreach (var member in members)
+                sb.Append(i4).Append("    case \"").Append(Escape(member.Description)).Append("\": result |= ").Append(fullName).Append(".").Append(member.Name).AppendLine("; break;");
+
+            sb.Append(i4).AppendLine("    default: throw new global::System.ArgumentException($\"No member of " + fullName + " matches '{desc}'.\");");
+            sb.Append(i4).AppendLine("}");
+            sb.Append(i3).AppendLine("}");
+            sb.Append(i3).AppendLine("return result;");
+            sb.Append(i2).AppendLine("}");
         }
 
         private static string Escape(string v) => v.Replace("\"", "\\\"");
@@ -249,13 +378,17 @@ namespace MyEnumSourceGenerator
         // JSON Converter (partial class gerada a partir de [GenerateEnumJsonConverters(typeof(T))])
         // ──────────────────────────────────────────────────────────────────────────────
 
-        private static ConverterModel? GetConverterModel(GeneratorAttributeSyntaxContext ctx)
+        private static ConverterModel? GetConverterModel(GeneratorAttributeSyntaxContext ctx, bool isArray, bool forceNumeric = false)
         {
             if (ctx.TargetSymbol is not INamedTypeSymbol classSymbol)
                 return null;
 
+            string expectedAttribute = forceNumeric
+                ? GenerateEnumNumericJsonConvertersAttributeFqn
+                : (isArray ? GenerateEnumArrayJsonConvertersAttributeFqn : GenerateEnumJsonConvertersAttributeFqn);
+
             var attr = ctx.Attributes.FirstOrDefault(a =>
-                a.AttributeClass?.ToDisplayString() == GenerateEnumJsonConvertersAttributeFqn);
+                a.AttributeClass?.ToDisplayString() == expectedAttribute);
 
             if (attr is null || attr.ConstructorArguments.Length == 0)
                 return null;
@@ -309,11 +442,20 @@ namespace MyEnumSourceGenerator
                 ? null
                 : enumSymbol.ContainingNamespace.ToDisplayString();
 
-            // Lê o separador do named argument (ex: Separator = ',')
+            // Lê o separador do named argument ou construtor
             char separator = '|';
-            var sepArg = attr.NamedArguments.FirstOrDefault(kv => kv.Key == "Separator");
-            if (sepArg.Key == "Separator" && sepArg.Value.Value is char sepChar)
-                separator = sepChar;
+            if (attr.ConstructorArguments.Length > 1 && attr.ConstructorArguments[1].Value is char consSep)
+            {
+                separator = consSep;
+            }
+            else
+            {
+                var sepArg = attr.NamedArguments.FirstOrDefault(kv => kv.Key == "Separator");
+                if (sepArg.Key == "Separator" && sepArg.Value.Value is char sepChar)
+                    separator = sepChar;
+            }
+
+            string underlyingType = enumSymbol.EnumUnderlyingType?.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) ?? "int";
 
             return new ConverterModel(
                 classNamespace: classNs,
@@ -322,7 +464,10 @@ namespace MyEnumSourceGenerator
                 enumName: enumSymbol.Name,
                 isFlags: isFlags,
                 readerMethod: readerMethod,
+                underlyingType: underlyingType,
                 separator: separator,
+                isArray: isArray,
+                forceNumeric: forceNumeric,
                 members: membersBuilder.ToImmutable()
             );
         }
@@ -352,17 +497,30 @@ namespace MyEnumSourceGenerator
                 sb.AppendLine("{");
             }
 
-            // Emite apenas "partial class" — o usuário já declarou sealed, public e o construtor
-            sb.Append(ind).Append("partial class ").AppendLine(model.ClassName);
+            sb.Append(ind).Append("partial class ").Append(model.ClassName)
+                .Append(" : global::System.Text.Json.Serialization.JsonConverter<")
+                .Append(fullEnum)
+                .AppendLine(">" );
             sb.Append(ind).AppendLine("{");
 
-            if (!model.IsFlags)
+            if (model.IsArray)
             {
-                EmitSimpleReadWrite(sb, fullEnum, model.ReaderMethod, i2);
+                EmitArrayReadWrite(sb, fullEnum, model.ReaderMethod, model.IsFlags, i2);
             }
             else
             {
-                EmitFlagsReadWrite(sb, fullEnum, model.ReaderMethod, model.Separator, i2);
+                if (model.ForceNumeric)
+                {
+                    EmitNumericReadWrite(sb, fullEnum, model.ReaderMethod, model.UnderlyingType, model.IsFlags, model.Separator, i2);
+                }
+                else if (!model.IsFlags)
+                {
+                    EmitSimpleReadWrite(sb, fullEnum, model.ReaderMethod, i2);
+                }
+                else
+                {
+                    EmitFlagsReadWrite(sb, fullEnum, model.ReaderMethod, model.Separator, i2);
+                }
             }
 
             sb.Append(ind).AppendLine("}");
@@ -412,6 +570,71 @@ namespace MyEnumSourceGenerator
             sb.Append(i2).AppendLine($"    writer.WriteStringValue(value.ToDescription('{separator}'));");
             sb.Append(i2).AppendLine("}");
         }
+
+        private static void EmitNumericReadWrite(StringBuilder sb, string fullEnum, string readerMethod, string underlyingType, bool isFlags, char separator, string i2)
+        {
+            sb.Append(i2).Append("public override ").Append(fullEnum)
+                .AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i2).AppendLine("    if (reader.TokenType == JsonTokenType.Number)");
+            sb.Append(i2).AppendLine("    {");
+            sb.Append(i2).AppendLine($"        return ({fullEnum})reader.{readerMethod}();");
+            sb.Append(i2).AppendLine("    }");
+            sb.Append(i2).AppendLine("    var str = reader.GetString();");
+            sb.Append(i2).AppendLine("    if (string.IsNullOrEmpty(str)) return default;");
+            if (isFlags)
+            {
+                sb.Append(i2).Append("    return ").Append(fullEnum).Append($".FromDescription(str.AsSpan(), '{separator}');").AppendLine();
+            }
+            else
+            {
+                sb.Append(i2).Append("    return ").Append(fullEnum).AppendLine(".FromDescription(str.AsSpan());");
+            }
+            sb.Append(i2).AppendLine("}");
+            sb.AppendLine();
+            sb.Append(i2).Append("public override void Write(Utf8JsonWriter writer, ").Append(fullEnum)
+                .AppendLine(" value, JsonSerializerOptions options)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i2).Append("    JsonSerializer.Serialize(writer, (").Append(underlyingType).AppendLine(")value, options);");
+            sb.Append(i2).AppendLine("}");
+        }
+
+        private static void EmitArrayReadWrite(StringBuilder sb, string fullEnum, string readerMethod, bool isFlags, string i2)
+        {
+            sb.Append(i2).Append("public override ").Append(fullEnum)
+                .AppendLine(" Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i2).AppendLine($"    if (reader.TokenType == JsonTokenType.Number) return ({fullEnum})reader.{readerMethod}();");
+            sb.Append(i2).AppendLine("    if (reader.TokenType == JsonTokenType.StartArray)");
+            sb.Append(i2).AppendLine("    {");
+            sb.Append(i2).AppendLine("        var array = JsonSerializer.Deserialize<string[]>(ref reader, options);");
+            sb.Append(i2).AppendLine("        if (array is null) return default;");
+            if (isFlags)
+            {
+                sb.Append(i2).AppendLine($"        return {fullEnum}.FromDescription(array);");
+            }
+            else
+            {
+                sb.Append(i2).AppendLine("        if (array.Length == 0) return default;");
+                sb.Append(i2).AppendLine($"        return {fullEnum}.FromDescription(array[0]);");
+            }
+            sb.Append(i2).AppendLine("    }");
+            sb.Append(i2).AppendLine("    var str = reader.GetString();");
+            sb.Append(i2).AppendLine("    if (string.IsNullOrEmpty(str)) return default;");
+            sb.Append(i2).AppendLine($"    return {fullEnum}.FromDescription(str.AsSpan());");
+            sb.Append(i2).AppendLine("}");
+            sb.AppendLine();
+            sb.Append(i2).Append("public override void Write(Utf8JsonWriter writer, ").Append(fullEnum)
+                .AppendLine(" value, JsonSerializerOptions options)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i2).AppendLine("    writer.WriteStartArray();");
+            sb.Append(i2).AppendLine("    foreach (var part in value.ToDescriptionArray())");
+            sb.Append(i2).AppendLine("    {");
+            sb.Append(i2).AppendLine("        writer.WriteStringValue(part);");
+            sb.Append(i2).AppendLine("    }");
+            sb.Append(i2).AppendLine("    writer.WriteEndArray();");
+            sb.Append(i2).AppendLine("}");
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────────
@@ -427,11 +650,12 @@ namespace MyEnumSourceGenerator
         public override int GetHashCode() => (Name.GetHashCode() * 397) ^ Description.GetHashCode();
     }
 
-    internal readonly struct EnumModel(string? @namespace, string enumName, bool isFlags, ImmutableArray<EnumMemberModel> members, Accessibility accessibility) : IEquatable<EnumModel>
+    internal readonly struct EnumModel(string? @namespace, string enumName, bool isFlags, char separator, ImmutableArray<EnumMemberModel> members, Accessibility accessibility) : IEquatable<EnumModel>
     {
         public string? Namespace { get; } = @namespace;
         public string EnumName { get; } = enumName;
         public bool IsFlags { get; } = isFlags;
+        public char Separator { get; } = separator;
         public Accessibility Accessibility { get; } = accessibility;
         public ImmutableArray<EnumMemberModel> Members { get; } = members;
 
@@ -439,6 +663,7 @@ namespace MyEnumSourceGenerator
             Namespace == other.Namespace &&
             EnumName == other.EnumName &&
             IsFlags == other.IsFlags &&
+            Separator == other.Separator &&
             Accessibility == other.Accessibility &&
             Members.SequenceEqual(other.Members);
 
@@ -451,6 +676,7 @@ namespace MyEnumSourceGenerator
                 h = h * 31 + (Namespace?.GetHashCode() ?? 0);
                 h = h * 31 + EnumName.GetHashCode();
                 h = h * 31 + IsFlags.GetHashCode();
+                h = h * 31 + Separator.GetHashCode();
                 return h;
             }
         }
@@ -463,7 +689,10 @@ namespace MyEnumSourceGenerator
         string enumName,
         bool isFlags,
         string readerMethod,
+        string underlyingType,
         char separator,
+        bool isArray,
+        bool forceNumeric,
         ImmutableArray<EnumMemberModel> members) : IEquatable<ConverterModel>
     {
         public string? ClassNamespace { get; } = classNamespace;
@@ -472,7 +701,10 @@ namespace MyEnumSourceGenerator
         public string EnumName { get; } = enumName;
         public bool IsFlags { get; } = isFlags;
         public string ReaderMethod { get; } = readerMethod;
+        public string UnderlyingType { get; } = underlyingType;
         public char Separator { get; } = separator;
+        public bool IsArray { get; } = isArray;
+        public bool ForceNumeric { get; } = forceNumeric;
         public ImmutableArray<EnumMemberModel> Members { get; } = members;
 
         public bool Equals(ConverterModel other) =>
@@ -482,7 +714,10 @@ namespace MyEnumSourceGenerator
             EnumName == other.EnumName &&
             IsFlags == other.IsFlags &&
             ReaderMethod == other.ReaderMethod &&
+            UnderlyingType == other.UnderlyingType &&
             Separator == other.Separator &&
+            IsArray == other.IsArray &&
+            ForceNumeric == other.ForceNumeric &&
             Members.SequenceEqual(other.Members);
 
         public override bool Equals(object? obj) => obj is ConverterModel o && Equals(o);
@@ -497,7 +732,10 @@ namespace MyEnumSourceGenerator
                 h = h * 31 + EnumName.GetHashCode();
                 h = h * 31 + IsFlags.GetHashCode();
                 h = h * 31 + ReaderMethod.GetHashCode();
+                h = h * 31 + UnderlyingType.GetHashCode();
                 h = h * 31 + Separator.GetHashCode();
+                h = h * 31 + IsArray.GetHashCode();
+                h = h * 31 + ForceNumeric.GetHashCode();
                 return h;
             }
         }
